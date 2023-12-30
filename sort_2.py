@@ -2,7 +2,12 @@ import sys
 import shutil
 import pathlib
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, as_completed
+from threading import RLock
 
+lock = RLock()
+
+path_routes = {}
 
 transliteration_map = {
     ord('А'): 'A', ord('Б'): 'B', ord('В'): 'V', ord('Г'): 'G', ord('Д'): 'D',
@@ -154,12 +159,24 @@ def make_dirs_for_sorted_file_paths(root_path: pathlib.Path) -> None:
                     parents=True, exist_ok=True)
 
 
-def move_files_to_its_category_dir(root_path: pathlib.Path) -> None:
+def move_files_to_its_category_dir() -> None:
     """
     Move files to related folder by type.
-    :param root_path: Folder used as root path for further actions of sorting.
     :return: None.
     """
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = []
+        for old, new in path_routes.items():
+            future = executor.submit(move_file, old, new)
+            futures.append(future)
+
+    for future in as_completed(futures):
+        future.result()
+
+
+def store_new_paths(root_path: pathlib.Path):
+    # with lock:
+    global path_routes
     for category, f_paths in actual_file_paths.items():
         for file_path in f_paths:
             if set(file_path.parts).intersection(
@@ -169,18 +186,32 @@ def move_files_to_its_category_dir(root_path: pathlib.Path) -> None:
             new_file_path = root_path / pathlib.Path(category) / \
                             f"{file_path.stem}{file_path.suffix}"
             # handle copies
-            if new_file_path.exists():
-                index = 1
-                while True:
-                    new_file_path = \
-                        root_path / pathlib.Path(category) / \
-                        f"{file_path.stem}({index}){file_path.suffix}"
-                    if new_file_path.exists():
-                        index += 1
-                        continue
-                    break
-            # move file to category dir
-            file_path.rename(new_file_path)
+            if new_file_path.exists() or new_file_path in path_routes.values():
+                path_routes |= {file_path: None}
+                continue
+                # index = 1
+                # while True:
+                #     new_file_path = \
+                #         root_path / pathlib.Path(category) / \
+                #         f"{file_path.stem}({index}){file_path.suffix}"
+                #     if new_file_path in path_routes.values():
+                #         index += 1
+                #         print(new_file_path)
+                #         continue
+                #     break
+            path_routes |= {file_path: new_file_path}
+
+
+def move_file(current_path, new_path):
+    # move file to category dir
+    try:
+        if new_path:
+            current_path.replace(new_path)
+        else:
+            current_path.unlink()
+    except FileExistsError as e:
+        print(path_routes)
+        print(e)
 
 
 def delete_empty_folders_recursive(root_path: pathlib.Path) -> None:
@@ -209,11 +240,14 @@ def extract_and_remove_archives(root_path: pathlib.Path) -> None:
     path = root_path / pathlib.Path("archives")
     for archive_path in path.glob('*'):
         if archive_path.is_file():
-            shutil.unpack_archive(
-                filename=str(archive_path),
-                extract_dir=str(archive_path.with_suffix(''))
-            )
-            archive_path.unlink()
+            try:
+                shutil.unpack_archive(
+                    filename=str(archive_path),
+                    extract_dir=str(archive_path.with_suffix(''))
+                )
+                archive_path.unlink()
+            except shutil.ReadError:
+                pass
 
 
 def get_sorted_extensions(root_path: pathlib.Path) -> None:
@@ -242,7 +276,10 @@ def get_sorted_files(root_path: pathlib.Path) -> None:
     for path in list(pathlib.Path(root_path).rglob('*')):
         if path.is_file():
             key = list(set(path.parts).intersection(set(sorted_files.keys())))
+            if not key:
+                print(path.parts)
             sorted_files[key[0]].append(path.name)
+
 
 def sort_files_by_path() -> dict:
     """
@@ -258,7 +295,6 @@ def sort_files_by_path() -> dict:
     """
     # get path from arg
     input_path = get_path_from_cli()
-
     # normalize names
     for path in pathlib.Path(input_path).rglob('*'):
         # Generate the new path with the desired name
@@ -274,7 +310,8 @@ def sort_files_by_path() -> dict:
 
     sort_paths_by_filetype(paths=file_paths)
     make_dirs_for_sorted_file_paths(root_path=input_path)
-    move_files_to_its_category_dir(root_path=input_path)
+    store_new_paths(root_path=input_path)
+    move_files_to_its_category_dir()
     delete_empty_folders_recursive(root_path=input_path)
     extract_and_remove_archives(root_path=input_path)
     get_sorted_files(root_path=input_path)
